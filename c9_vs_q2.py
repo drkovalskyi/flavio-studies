@@ -10,6 +10,7 @@ from importlib import import_module
 import flavio
 import yaml
 from pathlib import Path
+from scipy.stats import chi2 as scipy_chi2
 
 
 CHANNEL_PATTERNS = {
@@ -67,6 +68,18 @@ def _classify(name):
     return "other"
 
 
+def classify_obs_key(key):
+    """Return (channel, obs_type) for an observable key."""
+    name = key[0] if isinstance(key, tuple) else key
+    channel = "other"
+    for ch, pats in CHANNEL_PATTERNS.items():
+        if _matches_any(name, pats):
+            channel = ch
+            break
+    obs_type = _classify(name)
+    return channel, obs_type
+
+
 def discover_base_names(mode, obs_kind):
     """Return list of observable base names for a given mode and obs_kind."""
     pats = CHANNEL_PATTERNS[mode]
@@ -102,6 +115,28 @@ def resolve_pub_to_measurement_names(pub_ids, db):
         if _pub_key(db, mname) in pub_set:
             names.append(mname)
     return names
+
+
+def _filter_measurements_for_obs(obs_keys, include_meas):
+    """Filter measurement names to only those constraining at least one of obs_keys.
+
+    This prevents FastLikelihood from failing when a measurement in include_meas
+    doesn't constrain any of the observables in the sub-group.
+    """
+    obs_set = set(obs_keys)
+    filtered = []
+    for mname in include_meas:
+        try:
+            m = flavio.Measurement[mname]
+        except (KeyError, Exception):
+            continue
+        try:
+            params = set(m.all_parameters)
+        except Exception:
+            continue
+        if obs_set & params:
+            filtered.append(mname)
+    return filtered if filtered else None
 
 
 def find_publications_for_keys(keys_bin, db):
@@ -267,10 +302,30 @@ def interp_x_at_y(x1, y1, x2, y2, ytarget):
     return x1 + t * (x2 - x1)
 
 
+def _parabolic_sigma(c9_grid, logl, i0):
+    """Estimate sigma from a parabolic fit to 3 points around the maximum.
+
+    Returns sigma or nan if curvature is non-negative (flat/rising edges).
+    """
+    if i0 <= 0 or i0 >= len(c9_grid) - 1:
+        return float("nan")
+    x0, x1, x2 = c9_grid[i0 - 1], c9_grid[i0], c9_grid[i0 + 1]
+    y0, y1, y2 = logl[i0 - 1], logl[i0], logl[i0 + 1]
+    # second derivative of parabola through 3 equally-spaced points
+    h = x1 - x0
+    if h == 0:
+        return float("nan")
+    d2 = (y2 - 2 * y1 + y0) / (h * h)
+    if d2 >= 0:
+        return float("nan")
+    return 1.0 / math.sqrt(-d2)
+
+
 def estimate_best_and_sigma(c9_grid, logl):
     i0 = argmax(logl)
     c9_best = c9_grid[i0]
     ll_best = logl[i0]
+    at_boundary = (i0 == 0) or (i0 == len(c9_grid) - 1)
     target = ll_best - 0.5
 
     left = None
@@ -289,7 +344,11 @@ def estimate_best_and_sigma(c9_grid, logl):
     if left is not None and right is not None:
         sigma = 0.5 * (right - left)
 
-    return c9_best, sigma, left, right, ll_best
+    # Parabolic fallback when crossing method fails
+    if math.isnan(sigma):
+        sigma = _parabolic_sigma(c9_grid, logl, i0)
+
+    return c9_best, sigma, left, right, ll_best, at_boundary
 
 
 def get_fastlikelihood_class():
@@ -393,6 +452,194 @@ def fmt(x):
     return f"{x:.4g}"
 
 
+def chi2_from_pulls(pull_list):
+    """Compute chi2/ndf and p-value from a list of (label, pull) tuples.
+
+    chi2 = sum(pull_i^2).  This ignores off-diagonal correlations between
+    observables but is always non-negative and easy to interpret.
+    ndf = n_pulls - 1  (one fitted parameter: C9).
+    """
+    valid = [p for _, p in pull_list if not math.isnan(p)]
+    if not valid:
+        return float("nan"), 0, float("nan")
+    chi2_val = sum(p * p for p in valid)
+    ndf = len(valid) - 1
+    p_value = float(scipy_chi2.sf(chi2_val, ndf)) if ndf > 0 else float("nan")
+    return chi2_val, ndf, p_value
+
+
+def consistency_by_channel_type(keys_bin, include_meas, c9_grid_coarse, args):
+    """Fit C9 separately for each (channel, obs_type) sub-group.
+
+    Returns list of (label, c9_best, sigma, n_obs).
+    """
+    groups = defaultdict(list)
+    for k in keys_bin:
+        ch, ot = classify_obs_key(k)
+        groups[(ch, ot)].append(k)
+
+    results = []
+    for (ch, ot), keys in sorted(groups.items()):
+        label = f"{ch} {ot}"
+        n_obs = len(keys)
+        try:
+            sub_meas = _filter_measurements_for_obs(keys, include_meas) if include_meas else None
+            fl_sub = build_fastlikelihood(
+                name=f"consist_{ch}_{ot}",
+                observables=keys,
+                include_measurements=sub_meas,
+                threads=args.threads,
+                fast_N=args.fast_N,
+                fast_Nexp=args.fast_Nexp,
+            )
+            ll = scan_c9_fast(fl_sub, c9_grid_coarse, label=f"  {label}", report_every=0, threads=args.threads)
+            c9_best, sigma, _, _, _, at_bnd = estimate_best_and_sigma(c9_grid_coarse, ll)
+        except Exception as e:
+            print(f"    [warn] sub-scan {label} failed: {e}", flush=True)
+            c9_best, sigma, at_bnd = float("nan"), float("nan"), False
+        results.append((label, c9_best, sigma, n_obs, at_bnd))
+    return results
+
+
+def consistency_by_publication(keys_bin, include_meas, c9_grid_coarse, meas_db, curated_pubs, args):
+    """Fit C9 separately for each publication contributing to the bin.
+
+    Returns list of (pub_id, c9_best, sigma, n_obs).
+    """
+    all_pubs = find_publications_for_keys(keys_bin, meas_db)
+    if curated_pubs is not None:
+        curated_set = set(curated_pubs)
+        all_pubs = {p: obs for p, obs in all_pubs.items() if p in curated_set}
+
+    results = []
+    for pub_id, obs_keys in sorted(all_pubs.items()):
+        n_obs = len(obs_keys)
+        try:
+            pub_meas = resolve_pub_to_measurement_names([pub_id], meas_db)
+            if not pub_meas:
+                raise ValueError(f"no measurements for {pub_id}")
+            sub_meas = _filter_measurements_for_obs(obs_keys, pub_meas)
+            if not sub_meas:
+                raise ValueError(f"no constraining measurements for {pub_id}")
+            fl_sub = build_fastlikelihood(
+                name=f"consist_pub_{pub_id}",
+                observables=obs_keys,
+                include_measurements=sub_meas,
+                threads=args.threads,
+                fast_N=args.fast_N,
+                fast_Nexp=args.fast_Nexp,
+            )
+            ll = scan_c9_fast(fl_sub, c9_grid_coarse, label=f"  {pub_id}", report_every=0, threads=args.threads)
+            c9_best, sigma, _, _, _, at_bnd = estimate_best_and_sigma(c9_grid_coarse, ll)
+        except Exception as e:
+            print(f"    [warn] sub-scan {pub_id} failed: {e}", flush=True)
+            c9_best, sigma, at_bnd = float("nan"), float("nan"), False
+        results.append((pub_id, c9_best, sigma, n_obs, at_bnd))
+    return results
+
+
+def consistency_pulls(fl, c9_best, keys_bin):
+    """Compute pull = (measured - predicted) / sigma for each observable at best-fit C9.
+
+    Returns list of (obs_label, pull) sorted by |pull| descending.
+    """
+    wc = make_wc_delta_c9(c9_best)
+    par = fl.parameters_central
+
+    # Get measured central values
+    centrals = fl.pseudo_measurement.get_central_all()
+
+    # Get total uncertainties via random sampling
+    try:
+        errors_1d = fl.pseudo_measurement.get_1d_errors_random(N=500)
+    except Exception:
+        errors_1d = fl.pseudo_measurement.get_1d_errors_random()
+
+    pulls = []
+    for key in fl.observables:
+        if isinstance(key, tuple):
+            obs_name = key[0]
+            obs_args = {"q2min": key[1], "q2max": key[2]} if len(key) >= 3 else {}
+        else:
+            obs_name = key
+            obs_args = {}
+
+        try:
+            pred = flavio.Observable[obs_name].prediction_par(par, wc, **obs_args)
+        except Exception:
+            continue
+
+        meas = centrals.get(key, float("nan"))
+        sigma = errors_1d.get(key, float("nan"))
+
+        if sigma > 0:
+            pull = (meas - pred) / sigma
+        else:
+            pull = float("nan")
+
+        if isinstance(key, tuple) and len(key) >= 3:
+            label = f"{obs_name} [{key[1]},{key[2]}]"
+        else:
+            label = obs_name
+
+        pulls.append((label, pull))
+
+    pulls.sort(key=lambda x: abs(x[1]) if not math.isnan(x[1]) else 0, reverse=True)
+    return pulls
+
+
+def _fmt_c9_sig(c9, sig, at_boundary, grid_lo, grid_hi):
+    """Format C9 ± sigma, marking boundary hits with < or >."""
+    if math.isnan(c9):
+        return "C9 = nan"
+    if at_boundary:
+        if c9 <= grid_lo:
+            c9_str = f"C9 < {fmt(grid_lo)}"
+        else:
+            c9_str = f"C9 > {fmt(grid_hi)}"
+        if not math.isnan(sig):
+            return f"{c9_str}  (~{fmt(sig)})"
+        return c9_str
+    return f"C9 = {fmt(c9):>6s} \u00b1 {fmt(sig)}"
+
+
+def print_consistency_report(fl, c9_best, sigma, keys_bin, include_meas,
+                             c9_grid_coarse, meas_db, curated_pubs, args):
+    """Print a full consistency report for the current bin."""
+    grid_lo, grid_hi = c9_grid_coarse[0], c9_grid_coarse[-1]
+    print(f"\n  Consistency report:", flush=True)
+
+    # 1. Pulls (computed first so chi2 can be derived)
+    pull_list = consistency_pulls(fl, c9_best, keys_bin)
+
+    # 2. Combined chi2/ndf from pulls
+    chi2_val, ndf, p_value = chi2_from_pulls(pull_list)
+    print(f"    Combined: C9 = {c9_best:.2f} \u00b1 {sigma:.2f}, "
+          f"chi2/ndf = {chi2_val:.1f}/{ndf}, p = {p_value:.2f}", flush=True)
+
+    # 3. By channel x type
+    print(f"\n    By channel x type:", flush=True)
+    ch_results = consistency_by_channel_type(keys_bin, include_meas, c9_grid_coarse, args)
+    for label, c9, sig, nobs, at_bnd in ch_results:
+        c9s = _fmt_c9_sig(c9, sig, at_bnd, grid_lo, grid_hi)
+        print(f"      {label:<20s} {c9s}  ({nobs} obs)", flush=True)
+
+    # 4. By publication
+    print(f"\n    By publication:", flush=True)
+    pub_results = consistency_by_publication(keys_bin, include_meas, c9_grid_coarse, meas_db, curated_pubs, args)
+    for pub_id, c9, sig, nobs, at_bnd in pub_results:
+        c9s = _fmt_c9_sig(c9, sig, at_bnd, grid_lo, grid_hi)
+        print(f"      {pub_id:<20s} {c9s}  ({nobs} obs)", flush=True)
+
+    # 5. Pull table
+    print(f"\n    Pulls at C9 = {c9_best:.2f}:", flush=True)
+    for label, pull in pull_list:
+        sign = "+" if pull >= 0 else ""
+        print(f"      {label:<45s} {sign}{pull:.1f}\u03c3", flush=True)
+
+    print(flush=True)
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--threads", type=int, default=1)
@@ -415,6 +662,8 @@ def main():
     ap.add_argument("--all-publications", action="store_true",
                     help="Use all available measurements instead of the curated list.")
     ap.add_argument("--quiet-warnings", action="store_true")
+    ap.add_argument("--consistency", action="store_true",
+                    help="Print consistency report (chi2, sub-fits by channel/pub, pulls).")
     args = ap.parse_args()
 
     if args.quiet_warnings:
@@ -469,6 +718,7 @@ def main():
             veto_windows.append((float(lo), float(hi)))
 
     c9_grid = grid_linspace(args.c9min, args.c9max, args.npts)
+    c9_grid_coarse = grid_linspace(args.c9min, args.c9max, 41) if args.consistency else None
 
     print(f"\nMode={args.mode} obs_kind={args.obs_kind}", flush=True)
     if curated_pubs is not None:
@@ -501,9 +751,15 @@ def main():
         print(f"  Built in {time.time()-t0:.1f}s", flush=True)
 
         ll = scan_c9_fast(fl, c9_grid, label=f"{q2lo}-{q2hi}", report_every=args.report_every, threads=args.threads)
-        c9_best, sig, left, right, _ = estimate_best_and_sigma(c9_grid, ll)
+        c9_best, sig, left, right, _, _ = estimate_best_and_sigma(c9_grid, ll)
 
         results.append((q2lo, q2hi, len(keys_bin), c9_best, sig, left, right))
+
+        if args.consistency:
+            print_consistency_report(
+                fl, c9_best, sig, keys_bin, include_meas,
+                c9_grid_coarse, meas_db, curated_pubs, args,
+            )
 
     print("\n" + "=" * 92)
     print("Delta C9_bsmumu per q2 bin (piecewise effective fit)")

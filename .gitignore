@@ -1,0 +1,8 @@
+# Ignore Python bytecode caches (everywhere)
+__pycache__/
+
+# Ignore all dotfiles and dot directories (repo-wide)
+.*
+
+# Keep common dotfiles and dot dirs that are typically tracked
+!.gitignore

@@ -403,7 +403,7 @@ def main():
     ap.add_argument("--npts", type=int, default=161)
     ap.add_argument("--report-every", type=int, default=10)
 
-    ap.add_argument("--mode", choices=["Kstar", "K", "phi"], default="Kstar",
+    ap.add_argument("--mode", choices=["Kstar", "K", "phi", "all"], default="Kstar",
                     help="Which decay mode to use for the per-bin fit.")
     ap.add_argument("--obs-kind", choices=["angular", "rate", "both"], default="both",
                     help="Use angular observables, rate observables, or both.")
@@ -421,7 +421,14 @@ def main():
         warnings.filterwarnings("ignore", message=".*QCDF corrections should not be trusted.*")
         warnings.filterwarnings("ignore", message=".*predictions in the region of narrow charmonium resonances.*")
 
-    base_names = discover_base_names(args.mode, args.obs_kind)
+    if args.mode == "all":
+        modes = list(CHANNEL_PATTERNS.keys())
+    else:
+        modes = [args.mode]
+
+    base_names = []
+    for m in modes:
+        base_names.extend(discover_base_names(m, args.obs_kind))
 
     meas_db = _load_measurements_db()
 
@@ -429,7 +436,13 @@ def main():
         curated_pubs = None
         include_meas = None
     else:
-        curated_pubs = CURATED_PUBLICATIONS.get(args.mode, [])
+        curated_pubs = []
+        seen = set()
+        for m in modes:
+            for p in CURATED_PUBLICATIONS.get(m, []):
+                if p not in seen:
+                    curated_pubs.append(p)
+                    seen.add(p)
         include_meas = resolve_pub_to_measurement_names(curated_pubs, meas_db)
 
     # Resolve to constrained keys (restricted to included measurements if curated)

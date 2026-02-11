@@ -326,24 +326,39 @@ def build_fastlikelihood(name, observables, include_measurements=None,
     return fl
 
 
-def eval_logl_fast(fl, wc):
+def _eval_logl_worker(args):
+    fl, c9 = args
+    wc = make_wc_delta_c9(c9)
     par = fl.parameters_central
     return float(fl.log_likelihood(par, wc))
 
 
-def scan_c9_fast(fl, c9_grid, label="", report_every=10):
+def scan_c9_fast(fl, c9_grid, label="", report_every=10, threads=1):
     t0 = time.time()
-    out = []
     n = len(c9_grid)
-    print(f"[{label}] scan start ({n} points)", flush=True)
-    for i, c9 in enumerate(c9_grid, start=1):
-        wc = make_wc_delta_c9(c9)
-        out.append(eval_logl_fast(fl, wc))
-        if report_every and (i % report_every == 0 or i == n):
-            dt = time.time() - t0
-            rate = i / dt if dt > 0 else float("inf")
-            eta = (n - i) / rate if rate > 0 else float("inf")
-            print(f"[{label}] {i}/{n} elapsed {dt:.1f}s eta {eta:.1f}s", flush=True)
+    print(f"[{label}] scan start ({n} points, threads={threads})", flush=True)
+
+    if threads > 1:
+        from multiprocessing import Pool
+        with Pool(processes=threads) as pool:
+            work = [(fl, c9) for c9 in c9_grid]
+            out = []
+            for i, val in enumerate(pool.imap(_eval_logl_worker, work), start=1):
+                out.append(val)
+                if report_every and (i % report_every == 0 or i == n):
+                    dt = time.time() - t0
+                    rate = i / dt if dt > 0 else float("inf")
+                    eta = (n - i) / rate if rate > 0 else float("inf")
+                    print(f"[{label}] {i}/{n} elapsed {dt:.1f}s eta {eta:.1f}s", flush=True)
+    else:
+        out = []
+        for i, c9 in enumerate(c9_grid, start=1):
+            out.append(_eval_logl_worker((fl, c9)))
+            if report_every and (i % report_every == 0 or i == n):
+                dt = time.time() - t0
+                rate = i / dt if dt > 0 else float("inf")
+                eta = (n - i) / rate if rate > 0 else float("inf")
+                print(f"[{label}] {i}/{n} elapsed {dt:.1f}s eta {eta:.1f}s", flush=True)
     return out
 
 
@@ -472,7 +487,7 @@ def main():
         )
         print(f"  Built in {time.time()-t0:.1f}s", flush=True)
 
-        ll = scan_c9_fast(fl, c9_grid, label=f"{q2lo}-{q2hi}", report_every=args.report_every)
+        ll = scan_c9_fast(fl, c9_grid, label=f"{q2lo}-{q2hi}", report_every=args.report_every, threads=args.threads)
         c9_best, sig, left, right, _ = estimate_best_and_sigma(c9_grid, ll)
 
         results.append((q2lo, q2hi, len(keys_bin), c9_best, sig, left, right))

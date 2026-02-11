@@ -1,18 +1,205 @@
 #!/usr/bin/env python3
 import argparse
-import json
 import math
+import re
 import time
 import warnings
-from collections import OrderedDict, defaultdict
+from collections import defaultdict
 from importlib import import_module
 
 import flavio
+import yaml
+from pathlib import Path
 
 
-def load_groups(path):
-    with open(path, "r", encoding="utf-8") as f:
-        return json.load(f)
+CHANNEL_PATTERNS = {
+    "Kstar": [r"\bB0->K\*0?mumu\b", r"\bBd->K\*0?mumu\b"],
+    "K":     [r"\bB\+->K\+?mumu\b"],
+    "phi":   [r"\bBs->phimumu\b"],
+}
+
+# Curated list of publications to use per mode.
+# Only these are included by default to avoid double-counting.
+# Use --all-publications to override.
+CURATED_PUBLICATIONS = {
+    "Kstar": [
+        "Aaij:2020nrf",       # LHCb Run 1+2 angular (FL, AFB, S/P-basis)
+        "Aaij:2015oid",       # LHCb Run 1 (A7, A8, A9 — unique observables)
+        "Aaij:2016flj",       # LHCb Run 1 BR
+        "Aaboud:2018krd",     # ATLAS Run 2 angular
+        "CMS:2024atz",        # CMS 13 TeV 140/fb angular (FL, P1–P8')
+        "CMS:2017rzx",        # CMS 8 TeV angular (P1, P5' per-bin with correlations)
+        "Khachatryan:2015isa", # CMS 8 TeV (FL, AFB, BR — different obs from 2017rzx)
+        "CDF:2012qwd",        # CDF (FL, AFB, BR)
+    ],
+    "K": [
+        "Aaij:2014pli",       # LHCb B+->Kmumu BR
+        "CMS:2024aev",        # CMS 13 TeV 137/fb B+->Kmumu BR (R(K) paper)
+    ],
+    "phi": [
+        "Aaij:2015esa",       # LHCb Run 1 Bs->phimumu angular + BR
+        "Aaij:2021pkz",       # LHCb Run 1+2 Bs->phimumu BR
+        "LHCb:2021xxq",       # LHCb Run 1+2 Bs->phimumu angular
+        "CDF:2012qwd",        # CDF Bs->phimumu BR
+    ],
+}
+
+ANGULAR_KEYWORDS = [
+    "P1", "P2", "P3", "P4p", "P5p", "P6p", "P8p",
+    "S3", "S4", "S5", "S7", "S8", "S9",
+    "A_FB", "AFB", "F_L", "FL", "A9", "A7", "A8",
+    "J_", "A_T", "AT", "Q_",
+]
+RATE_KEYWORDS = ["dBR", "BR", "dG", "Gamma", "d^2BR", "d^2Gamma"]
+
+
+def _matches_any(name, patterns):
+    return any(re.search(p, name) for p in patterns)
+
+
+def _classify(name):
+    for kw in ANGULAR_KEYWORDS:
+        if kw in name:
+            return "angular"
+    for kw in RATE_KEYWORDS:
+        if kw in name:
+            return "rate"
+    return "other"
+
+
+def discover_base_names(mode, obs_kind):
+    """Return list of observable base names for a given mode and obs_kind."""
+    pats = CHANNEL_PATTERNS[mode]
+    groups = defaultdict(list)
+    for o in sorted(flavio.Observable.instances.keys()):
+        if _matches_any(o, pats):
+            groups[_classify(o)].append(o)
+    names = []
+    if obs_kind in ("angular", "both"):
+        names.extend(groups["angular"])
+    if obs_kind in ("rate", "both"):
+        names.extend(groups["rate"])
+    return names
+
+
+def _load_measurements_db():
+    p = Path(flavio.__file__).resolve().parent / "data" / "measurements.yml"
+    return yaml.safe_load(p.read_text(encoding="utf-8")) if p.exists() else {}
+
+
+def _pub_key(db, mname):
+    meta = db.get(mname)
+    if isinstance(meta, dict):
+        return meta.get("inspire") or meta.get("arxiv") or meta.get("eprint") or mname
+    return mname
+
+
+def resolve_pub_to_measurement_names(pub_ids, db):
+    """Return list of flavio measurement names that belong to any of the given publication IDs."""
+    pub_set = set(pub_ids)
+    names = []
+    for mname in flavio.Measurement.instances:
+        if _pub_key(db, mname) in pub_set:
+            names.append(mname)
+    return names
+
+
+def find_publications_for_keys(keys_bin, db):
+    """Return {pub_id: [list of obs keys]} for measurements that constrain any of keys_bin."""
+    keys_set = set(keys_bin)
+    pubs = defaultdict(set)
+    for mname, m in flavio.Measurement.instances.items():
+        try:
+            overlap = keys_set & set(m.all_parameters)
+        except Exception:
+            continue
+        if overlap:
+            pid = _pub_key(db, mname)
+            pubs[pid].update(overlap)
+    return {pid: sorted(obs) for pid, obs in sorted(pubs.items())}
+
+
+def _experiment_for_pub(db, pid):
+    """Return experiment name for a publication id."""
+    for mname, meta in db.items():
+        if not isinstance(meta, dict):
+            continue
+        mpid = meta.get("inspire") or meta.get("arxiv") or meta.get("eprint")
+        if mpid == pid:
+            return meta.get("experiment", "?")
+    return "?"
+
+
+def check_overlap_warnings(keys_bin, db):
+    """Detect same-experiment publications measuring the same observable in overlapping bins."""
+    # Build: (experiment, obs_name, q2min, q2max) -> [pub_id, ...]
+    keys_set = set(keys_bin)
+    # pub_id -> experiment
+    pub_exp = {}
+    # pub_id -> set of keys
+    pub_keys = defaultdict(set)
+    for mname, m in flavio.Measurement.instances.items():
+        try:
+            overlap = keys_set & set(m.all_parameters)
+        except Exception:
+            continue
+        if not overlap:
+            continue
+        pid = _pub_key(db, mname)
+        if pid not in pub_exp:
+            pub_exp[pid] = _experiment_for_pub(db, pid)
+        pub_keys[pid].update(overlap)
+
+    # Group pubs by experiment
+    exp_pubs = defaultdict(list)
+    for pid, exp in pub_exp.items():
+        exp_pubs[exp].append(pid)
+
+    warnings = []
+    for exp, pids in exp_pubs.items():
+        if len(pids) < 2:
+            continue
+        # For each pair of pubs from the same experiment, check for overlapping obs
+        for i, p1 in enumerate(pids):
+            for p2 in pids[i+1:]:
+                shared = pub_keys[p1] & pub_keys[p2]
+                if shared:
+                    obs_names = sorted(set(
+                        k[0] if isinstance(k, tuple) else k for k in shared
+                    ))
+                    warnings.append((exp, p1, p2, obs_names))
+    return warnings
+
+
+def print_bin_publications(q2lo, q2hi, keys_bin, db, curated_pubs=None):
+    """Print which publications contribute to this bin."""
+    all_pubs = find_publications_for_keys(keys_bin, db)
+    obs_names = sorted(set(k[0] if isinstance(k, tuple) else k for k in keys_bin))
+    print(f"  Observables: {', '.join(obs_names)}")
+
+    if curated_pubs is not None:
+        curated_set = set(curated_pubs)
+        active = {p: o for p, o in all_pubs.items() if p in curated_set}
+        skipped = {p: o for p, o in all_pubs.items() if p not in curated_set}
+    else:
+        active = all_pubs
+        skipped = {}
+
+    print(f"  Publications ({len(active)}):")
+    for pid, obs in active.items():
+        names = sorted(set(k[0] if isinstance(k, tuple) else k for k in obs))
+        print(f"    {pid}: {', '.join(names)}")
+    if skipped:
+        print(f"  Skipped ({len(skipped)}):")
+        for pid, obs in skipped.items():
+            names = sorted(set(k[0] if isinstance(k, tuple) else k for k in obs))
+            print(f"    {pid}: {', '.join(names)}")
+
+    overlap_warnings = check_overlap_warnings(keys_bin, db)
+    if overlap_warnings:
+        print(f"  *** OVERLAP WARNINGS (all publications) ***")
+        for exp, p1, p2, obs_names in overlap_warnings:
+            print(f"    {exp}: {p1} & {p2} both measure {', '.join(obs_names)}")
 
 
 def is_binned_key(k):
@@ -37,10 +224,12 @@ def iter_measurement_constraint_keys(m):
         return
 
 
-def collect_constrained_obs_for_base_names(base_names):
+def collect_constrained_obs_for_base_names(base_names, include_measurements=None):
     base_names = set(base_names)
     found = set()
     for m in flavio.Measurement.instances.values():
+        if include_measurements is not None and m.name not in include_measurements:
+            continue
         for obs in iter_measurement_constraint_keys(m):
             if obs and obs[0] in base_names:
                 found.add(obs)
@@ -116,7 +305,8 @@ def get_fastlikelihood_class():
     raise RuntimeError("FastLikelihood not found in this flavio version.")
 
 
-def build_fastlikelihood(name, observables, threads=1, fast_N=100, fast_Nexp=5000):
+def build_fastlikelihood(name, observables, include_measurements=None,
+                         threads=1, fast_N=100, fast_Nexp=5000):
     FastLikelihood = get_fastlikelihood_class()
     fl = FastLikelihood(
         name=name,
@@ -125,7 +315,7 @@ def build_fastlikelihood(name, observables, threads=1, fast_N=100, fast_Nexp=500
         nuisance_parameters="all",
         observables=observables,
         exclude_measurements=None,
-        include_measurements=None,
+        include_measurements=include_measurements,
     )
 
     # precompute
@@ -164,7 +354,8 @@ def overlaps_any(q2min, q2max, veto_windows):
     return False
 
 
-def filter_to_exact_bin(keys, q2bin, veto_windows):
+def filter_to_contained_bin(keys, q2bin, veto_windows):
+    """Select observable keys whose q2 range is contained within q2bin."""
     q2lo, q2hi = q2bin
     out = []
     for k in keys:
@@ -172,7 +363,7 @@ def filter_to_exact_bin(keys, q2bin, veto_windows):
             continue
         q2min = float(k[1])
         q2max = float(k[2])
-        if abs(q2min - q2lo) < 1e-9 and abs(q2max - q2hi) < 1e-9:
+        if q2min >= q2lo - 1e-9 and q2max <= q2hi + 1e-9:
             if veto_windows and overlaps_any(q2min, q2max, veto_windows):
                 continue
             out.append(k)
@@ -189,7 +380,6 @@ def fmt(x):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--out-json", default="out.json")
     ap.add_argument("--threads", type=int, default=1)
     ap.add_argument("--fast-N", type=int, default=100)
     ap.add_argument("--fast-Nexp", type=int, default=5000)
@@ -200,13 +390,15 @@ def main():
 
     ap.add_argument("--mode", choices=["Kstar", "K", "phi"], default="Kstar",
                     help="Which decay mode to use for the per-bin fit.")
-    ap.add_argument("--obs-kind", choices=["angular", "rate", "both"], default="angular",
+    ap.add_argument("--obs-kind", choices=["angular", "rate", "both"], default="both",
                     help="Use angular observables, rate observables, or both.")
 
     ap.add_argument("--bins", default="0.1-0.98,1.1-2.5,2.5-4,4-6,15-17,17-19",
                     help="Comma-separated q2 bins, each as lo-hi in GeV^2.")
     ap.add_argument("--veto", default="8.68-14.18",
                     help="Comma-separated veto windows lo-hi. Use empty string to disable.")
+    ap.add_argument("--all-publications", action="store_true",
+                    help="Use all available measurements instead of the curated list.")
     ap.add_argument("--quiet-warnings", action="store_true")
     args = ap.parse_args()
 
@@ -214,24 +406,20 @@ def main():
         warnings.filterwarnings("ignore", message=".*QCDF corrections should not be trusted.*")
         warnings.filterwarnings("ignore", message=".*predictions in the region of narrow charmonium resonances.*")
 
-    groups = load_groups(args.out_json)
+    base_names = discover_base_names(args.mode, args.obs_kind)
 
-    # Choose base-name lists from out.json groups
-    if args.mode == "Kstar":
-        base = groups["B0->K*0mumu"]
-    elif args.mode == "K":
-        base = groups["B+->Kmumu"]
+    meas_db = _load_measurements_db()
+
+    if args.all_publications:
+        curated_pubs = None
+        include_meas = None
     else:
-        base = groups["Bs->phimumu"]
+        curated_pubs = CURATED_PUBLICATIONS.get(args.mode, [])
+        include_meas = resolve_pub_to_measurement_names(curated_pubs, meas_db)
 
-    base_names = []
-    if args.obs_kind in ["angular", "both"]:
-        base_names.extend(base["angular"])
-    if args.obs_kind in ["rate", "both"]:
-        base_names.extend(base["rate"])
-
-    # Resolve to constrained keys across the DB
-    all_keys = collect_constrained_obs_for_base_names(base_names)
+    # Resolve to constrained keys (restricted to included measurements if curated)
+    include_meas_set = set(include_meas) if include_meas is not None else None
+    all_keys = collect_constrained_obs_for_base_names(base_names, include_meas_set)
 
     # Parse bins
     q2bins = []
@@ -255,27 +443,34 @@ def main():
     c9_grid = grid_linspace(args.c9min, args.c9max, args.npts)
 
     print(f"\nMode={args.mode} obs_kind={args.obs_kind}", flush=True)
+    if curated_pubs is not None:
+        print(f"Publications: {', '.join(curated_pubs)}", flush=True)
+    else:
+        print(f"Publications: all (no filter)", flush=True)
     print(f"Bins={q2bins}", flush=True)
     print(f"Veto={veto_windows}", flush=True)
     print(f"Grid: [{args.c9min},{args.c9max}] npts={args.npts}", flush=True)
 
     results = []
     for (q2lo, q2hi) in q2bins:
-        keys_bin = filter_to_exact_bin(all_keys, (q2lo, q2hi), veto_windows=veto_windows)
+        keys_bin = filter_to_contained_bin(all_keys, (q2lo, q2hi), veto_windows=veto_windows)
         if not keys_bin:
             print(f"\nBin {q2lo}-{q2hi}: no exact-edge constrained observables found, skipping.", flush=True)
             continue
 
-        print(f"\nBin {q2lo}-{q2hi}: nobs={len(keys_bin)} build FastLikelihood...", flush=True)
+        print(f"\nBin {q2lo}-{q2hi}: nobs={len(keys_bin)}", flush=True)
+        print_bin_publications(q2lo, q2hi, keys_bin, meas_db, curated_pubs=curated_pubs)
+        print(f"  Building FastLikelihood...", flush=True)
         t0 = time.time()
         fl = build_fastlikelihood(
             name=f"{args.mode}_{args.obs_kind}_{q2lo}_{q2hi}",
             observables=keys_bin,
+            include_measurements=include_meas,
             threads=args.threads,
             fast_N=args.fast_N,
             fast_Nexp=args.fast_Nexp,
         )
-        print(f"Bin {q2lo}-{q2hi}: built in {time.time()-t0:.1f}s", flush=True)
+        print(f"  Built in {time.time()-t0:.1f}s", flush=True)
 
         ll = scan_c9_fast(fl, c9_grid, label=f"{q2lo}-{q2hi}", report_every=args.report_every)
         c9_best, sig, left, right, _ = estimate_best_and_sigma(c9_grid, ll)
@@ -293,7 +488,7 @@ def main():
 
     print("\nNotes:")
     print("- This is an effective Delta C9 per bin (absorbs nonlocal charm).")
-    print("- It uses only observables whose bin edges exactly match the requested bin list.")
+    print("- It uses all observables whose q2 bin is contained within the requested bin.")
     print("- Veto removes any bin overlapping the specified windows.")
     print("- For speed while iterating: try --fast-N 50 --fast-Nexp 1000 and fewer --npts.")
 

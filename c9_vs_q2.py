@@ -164,7 +164,7 @@ def _experiment_for_pub(db, pid):
     return "?"
 
 
-def check_overlap_warnings(keys_bin, db):
+def check_overlap_warnings(keys_bin, db, include_meas=None):
     """Detect same-experiment publications measuring the same observable in overlapping bins."""
     # Build: (experiment, obs_name, q2min, q2max) -> [pub_id, ...]
     keys_set = set(keys_bin)
@@ -173,6 +173,8 @@ def check_overlap_warnings(keys_bin, db):
     # pub_id -> set of keys
     pub_keys = defaultdict(set)
     for mname, m in flavio.Measurement.instances.items():
+        if include_meas is not None and mname not in include_meas:
+            continue
         try:
             overlap = keys_set & set(m.all_parameters)
         except Exception:
@@ -205,11 +207,11 @@ def check_overlap_warnings(keys_bin, db):
     return warnings
 
 
-def print_bin_publications(q2lo, q2hi, keys_bin, db, curated_pubs=None):
+def print_bin_publications(q2lo, q2hi, keys_bin, db, curated_pubs=None, include_meas=None):
     """Print which publications contribute to this bin."""
     all_pubs = find_publications_for_keys(keys_bin, db)
     obs_names = sorted(set(k[0] if isinstance(k, tuple) else k for k in keys_bin))
-    print(f"  Observables: {', '.join(obs_names)}")
+    print(f"  Observables: {_compact_obs_names(obs_names)}")
 
     if curated_pubs is not None:
         curated_set = set(curated_pubs)
@@ -222,18 +224,18 @@ def print_bin_publications(q2lo, q2hi, keys_bin, db, curated_pubs=None):
     print(f"  Publications ({len(active)}):")
     for pid, obs in active.items():
         names = sorted(set(k[0] if isinstance(k, tuple) else k for k in obs))
-        print(f"    {pid}: {', '.join(names)}")
+        print(f"    {pid}: {_compact_obs_names(names)}")
     if skipped:
         print(f"  Skipped ({len(skipped)}):")
         for pid, obs in skipped.items():
             names = sorted(set(k[0] if isinstance(k, tuple) else k for k in obs))
-            print(f"    {pid}: {', '.join(names)}")
+            print(f"    {pid}: {_compact_obs_names(names)}")
 
-    overlap_warnings = check_overlap_warnings(keys_bin, db)
+    overlap_warnings = check_overlap_warnings(keys_bin, db, include_meas=include_meas)
     if overlap_warnings:
-        print(f"  *** OVERLAP WARNINGS (all publications) ***")
+        print(f"  *** OVERLAP WARNINGS ***")
         for exp, p1, p2, obs_names in overlap_warnings:
-            print(f"    {exp}: {p1} & {p2} both measure {', '.join(obs_names)}")
+            print(f"    {exp}: {p1} & {p2} both measure {_compact_obs_names(obs_names)}")
 
 
 def is_binned_key(k):
@@ -867,13 +869,13 @@ def _fmt_c9_sig(c9, sig, at_boundary, grid_lo, grid_hi):
         return "C9 = nan"
     if at_boundary:
         if c9 <= grid_lo:
-            c9_str = f"C9 < {fmt(grid_lo)}"
+            c9_str = f"C9 < {grid_lo:.2f}"
         else:
-            c9_str = f"C9 > {fmt(grid_hi)}"
+            c9_str = f"C9 > {grid_hi:.2f}"
         if not math.isnan(sig):
-            return f"{c9_str}  (~{fmt(sig)})"
+            return f"{c9_str}  (~{sig:.2f})"
         return c9_str
-    return f"C9 = {fmt(c9):>6s} \u00b1 {fmt(sig)}"
+    return f"C9 = {c9:>6.2f} \u00b1 {sig:.2f}"
 
 
 def print_consistency_report(fl, c9_best, sigma, keys_bin, include_meas,
@@ -1023,7 +1025,7 @@ def main():
             continue
 
         print(f"\nBin {q2lo}-{q2hi}: nobs={len(keys_bin)}", flush=True)
-        print_bin_publications(q2lo, q2hi, keys_bin, meas_db, curated_pubs=curated_pubs)
+        print_bin_publications(q2lo, q2hi, keys_bin, meas_db, curated_pubs=curated_pubs, include_meas=include_meas)
         print(f"  Building FastLikelihood...", flush=True)
         t0 = time.time()
         fl = build_fastlikelihood(
@@ -1052,8 +1054,8 @@ def main():
     print("=" * 92)
     print("{:>10} {:>10} {:>6} {:>12} {:>10} {:>12} {:>12}".format("q2min", "q2max", "Nobs", "C9_best", "sigma", "68%_lo", "68%_hi"))
     for (q2lo, q2hi, nobs, c9_best, sig, left, right) in results:
-        print("{:>10.2f} {:>10.2f} {:>6d} {:>12} {:>10} {:>12} {:>12}".format(
-            q2lo, q2hi, nobs, fmt(c9_best), fmt(sig), fmt(left), fmt(right)
+        print("{:>10.2f} {:>10.2f} {:>6d} {:>12.2f} {:>10.2f} {:>12.2f} {:>12.2f}".format(
+            q2lo, q2hi, nobs, c9_best, sig, left, right
         ))
 
     print("\nNotes:")

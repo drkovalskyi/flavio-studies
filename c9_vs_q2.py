@@ -4,7 +4,7 @@ import math
 import re
 import time
 import warnings
-from collections import defaultdict
+from collections import defaultdict, OrderedDict
 from importlib import import_module
 
 import flavio
@@ -38,7 +38,6 @@ CURATED_PUBLICATIONS = {
         "CMS:2024aev",        # CMS 13 TeV 137/fb B+->Kmumu BR (R(K) paper)
     ],
     "phi": [
-        "Aaij:2015esa",       # LHCb Run 1 Bs->phimumu angular + BR
         "Aaij:2021pkz",       # LHCb Run 1+2 Bs->phimumu BR
         "LHCb:2021xxq",       # LHCb Run 1+2 Bs->phimumu angular
         "CDF:2012qwd",        # CDF Bs->phimumu BR
@@ -429,9 +428,14 @@ def overlaps_any(q2min, q2max, veto_windows):
 
 
 def filter_to_contained_bin(keys, q2bin, veto_windows):
-    """Select observable keys whose q2 range is contained within q2bin."""
+    """Select observable keys whose q2 range is contained within q2bin.
+
+    Returns (contained, excluded_overlap) where excluded_overlap are keys
+    that overlap the scan bin but are not fully contained.
+    """
     q2lo, q2hi = q2bin
-    out = []
+    contained = []
+    excluded_overlap = []
     for k in keys:
         if not is_binned_key(k):
             continue
@@ -440,8 +444,277 @@ def filter_to_contained_bin(keys, q2bin, veto_windows):
         if q2min >= q2lo - 1e-9 and q2max <= q2hi + 1e-9:
             if veto_windows and overlaps_any(q2min, q2max, veto_windows):
                 continue
-            out.append(k)
-    return out
+            contained.append(k)
+        elif q2min < q2hi and q2max > q2lo:
+            # Overlaps but not contained
+            if veto_windows and overlaps_any(q2min, q2max, veto_windows):
+                continue
+            excluded_overlap.append(k)
+    return contained, excluded_overlap
+
+
+##############################################################################
+# Two-phase global bin selection
+##############################################################################
+
+def compute_active_intervals(q2bins, veto_windows):
+    """Return sorted non-overlapping intervals = union(scan bins) minus veto."""
+    # 1. Merge overlapping scan bins
+    intervals = sorted(q2bins)
+    merged = []
+    for lo, hi in intervals:
+        if merged and lo <= merged[-1][1] + 1e-12:
+            merged[-1] = (merged[-1][0], max(merged[-1][1], hi))
+        else:
+            merged.append((lo, hi))
+    # 2. Subtract veto windows
+    for vlo, vhi in veto_windows:
+        new = []
+        for lo, hi in merged:
+            if vhi <= lo or vlo >= hi:
+                new.append((lo, hi))
+            else:
+                if lo < vlo:
+                    new.append((lo, vlo))
+                if vhi < hi:
+                    new.append((vhi, hi))
+        merged = new
+    return merged
+
+
+def overlap_with_active(q2min, q2max, active_intervals):
+    """Return total overlap length between [q2min, q2max] and active intervals."""
+    total = 0.0
+    for lo, hi in active_intervals:
+        ov_lo = max(q2min, lo)
+        ov_hi = min(q2max, hi)
+        if ov_hi > ov_lo:
+            total += ov_hi - ov_lo
+    return total
+
+
+def group_keys_by_paper_obs(all_keys, include_meas, meas_db):
+    """Return dict[(paper_id, obs_name)] -> list[key] for binned observable keys.
+
+    Groups keys by their publication and base observable name,
+    considering only measurements in include_meas.
+    """
+    # Build key -> set of paper_ids
+    key_papers = defaultdict(set)
+    for mname, m in flavio.Measurement.instances.items():
+        if include_meas is not None and mname not in include_meas:
+            continue
+        pid = _pub_key(meas_db, mname)
+        try:
+            params = set(m.all_parameters)
+        except Exception:
+            continue
+        for k in all_keys:
+            if k in params:
+                key_papers[k].add(pid)
+
+    groups = defaultdict(list)
+    for k in all_keys:
+        if not is_binned_key(k):
+            continue
+        obs_name = k[0]
+        for pid in key_papers.get(k, set()):
+            groups[(pid, obs_name)].append(k)
+    return groups
+
+
+def select_non_overlapping_max_coverage(bins, active_intervals):
+    """Weighted interval scheduling DP to select non-overlapping bins
+    maximizing total coverage of active range.
+
+    bins: list of (q2min, q2max) tuples
+    Returns: list of selected (q2min, q2max) tuples
+    """
+    if not bins:
+        return []
+
+    # Sort by right endpoint
+    indexed = sorted(range(len(bins)), key=lambda i: bins[i][1])
+    sorted_bins = [bins[i] for i in indexed]
+    n = len(sorted_bins)
+
+    # Compute weights
+    eps = 1e-9  # tiebreaker: prefer more (finer) bins
+    weights = []
+    for q2min, q2max in sorted_bins:
+        w = overlap_with_active(q2min, q2max, active_intervals)
+        weights.append(w + eps)
+
+    # p[i] = index of last interval that doesn't overlap with i, or -1
+    import bisect
+    right_ends = [b[1] for b in sorted_bins]
+    p = []
+    for i in range(n):
+        lo = sorted_bins[i][0]
+        # Find rightmost interval ending <= lo
+        j = bisect.bisect_right(right_ends, lo + 1e-12) - 1
+        if j < 0 or j >= i:
+            # Ensure we don't point at i or beyond
+            j2 = -1
+            for jj in range(i - 1, -1, -1):
+                if sorted_bins[jj][1] <= lo + 1e-12:
+                    j2 = jj
+                    break
+            p.append(j2)
+        else:
+            p.append(j)
+
+    # DP
+    dp = [0.0] * n
+    dp[0] = weights[0]
+    for i in range(1, n):
+        skip = dp[i - 1]
+        take = weights[i] + (dp[p[i]] if p[i] >= 0 else 0.0)
+        dp[i] = max(skip, take)
+
+    # Backtrack
+    selected = []
+    i = n - 1
+    while i >= 0:
+        take = weights[i] + (dp[p[i]] if p[i] >= 0 else 0.0)
+        skip = dp[i - 1] if i > 0 else 0.0
+        if take >= skip:
+            selected.append(sorted_bins[i])
+            i = p[i]
+        else:
+            i -= 1
+
+    selected.reverse()
+    return selected
+
+
+def select_bins_global(all_keys, include_meas, meas_db, q2bins, veto_windows):
+    """Phase 1: globally select non-overlapping measurement bins per (paper, obs).
+
+    Returns:
+        selected_keys: set of keys that passed global selection
+        report: list of (paper_id, obs_name, included_bins, excluded_bins) for printing
+    """
+    active = compute_active_intervals(q2bins, veto_windows)
+    groups = group_keys_by_paper_obs(all_keys, include_meas, meas_db)
+
+    selected_keys = set()
+    report = []
+
+    for (pid, obs_name), keys in sorted(groups.items()):
+        # Collect measurement bins for this group
+        bin_to_keys = defaultdict(list)
+        for k in keys:
+            q2min, q2max = float(k[1]), float(k[2])
+            bin_to_keys[(q2min, q2max)].append(k)
+
+        # Eligibility filter: >=50% of measurement bin width overlaps active range,
+        # AND the bin can actually be assigned to at least one scan bin (>=50%
+        # of its width falls within some scan bin).
+        eligible_bins = []
+        for (q2min, q2max), ks in bin_to_keys.items():
+            width = q2max - q2min
+            if width <= 0:
+                continue
+            ov = overlap_with_active(q2min, q2max, active)
+            if ov / width < 0.5:
+                continue
+            # Check assignability: must fit in at least one scan bin
+            assignable = False
+            for sq2lo, sq2hi in q2bins:
+                sov = min(sq2hi, q2max) - max(sq2lo, q2min)
+                if sov > 0 and sov / width >= 0.5:
+                    assignable = True
+                    break
+            if assignable:
+                eligible_bins.append((q2min, q2max))
+
+        # Run DP selection
+        chosen = select_non_overlapping_max_coverage(eligible_bins, active)
+        chosen_set = set(chosen)
+
+        # Classify keys as selected or excluded
+        included_bins = sorted(chosen_set)
+        excluded_bins = sorted(set(bin_to_keys.keys()) - chosen_set)
+
+        for b in included_bins:
+            for k in bin_to_keys[b]:
+                selected_keys.add(k)
+
+        report.append((pid, obs_name, included_bins, excluded_bins))
+
+    return selected_keys, report
+
+
+def assign_keys_to_scan_bin(selected_keys, q2bin, veto_windows, min_containment=0.5):
+    """Phase 2: assign globally-selected keys to a scan bin.
+
+    A key is included if >=min_containment of its measurement bin width
+    overlaps the scan bin, and it doesn't overlap a veto window.
+
+    Returns list of assigned keys.
+    """
+    q2lo, q2hi = q2bin
+    assigned = []
+    for k in selected_keys:
+        if not is_binned_key(k):
+            continue
+        q2min, q2max = float(k[1]), float(k[2])
+        width = q2max - q2min
+        if width <= 0:
+            continue
+        if veto_windows and overlaps_any(q2min, q2max, veto_windows):
+            continue
+        ov = min(q2hi, q2max) - max(q2lo, q2min)
+        if ov <= 0:
+            continue
+        if ov / width >= min_containment:
+            assigned.append(k)
+    return sorted(assigned)
+
+
+def _compact_obs_names(obs_names):
+    """Format observable names compactly by factoring out the common decay channel.
+
+    E.g. ['<FL>(B0->K*mumu)', '<P1>(B0->K*mumu)'] -> 'FL, P1 (B0->K*mumu)'
+    """
+    # Parse each name into (short, channel) where possible
+    parsed = OrderedDict()  # channel -> [short_name, ...]
+    for name in obs_names:
+        # Match pattern like <obs>(decay)
+        m = re.match(r'^<(.+?)>\((.+)\)$', name)
+        if m:
+            parsed.setdefault(m.group(2), []).append(m.group(1))
+        else:
+            parsed.setdefault('', []).append(name)
+    parts = []
+    for channel, shorts in parsed.items():
+        if channel:
+            parts.append(f"{', '.join(shorts)} ({channel})")
+        else:
+            parts.append(", ".join(shorts))
+    return "; ".join(parts)
+
+
+def print_selection_report(report):
+    """Print the global bin selection summary, grouping observables with identical bins."""
+    # Group by paper, then by (included, excluded) bin signature
+    paper_groups = OrderedDict()  # pid -> {(inc_tuple, exc_tuple): [obs_name, ...]}
+    for pid, obs_name, included, excluded in report:
+        sig = (tuple(included), tuple(excluded))
+        paper_groups.setdefault(pid, OrderedDict()).setdefault(sig, []).append(obs_name)
+
+    n_papers = len(paper_groups)
+    print(f"\nGlobal bin selection ({n_papers} papers):", flush=True)
+    for pid, sig_map in paper_groups.items():
+        for (inc, exc), obs_names in sig_map.items():
+            obs_str = _compact_obs_names(obs_names)
+            inc_str = " ".join(f"[{lo},{hi}]" for lo, hi in inc) if inc else "(none)"
+            print(f"  {pid} / {obs_str}:", flush=True)
+            print(f"    included: {inc_str}", flush=True)
+            if exc:
+                exc_str = " ".join(f"[{lo},{hi}]" for lo, hi in exc)
+                print(f"    excluded: {exc_str}", flush=True)
 
 
 def fmt(x):
@@ -729,11 +1002,24 @@ def main():
     print(f"Veto={veto_windows}", flush=True)
     print(f"Grid: [{args.c9min},{args.c9max}] npts={args.npts}", flush=True)
 
+    # Phase 1: global bin selection (used when curated publications are active)
+    use_global_selection = not args.all_publications
+    if use_global_selection:
+        include_meas_set_for_sel = set(include_meas) if include_meas is not None else None
+        selected_keys, selection_report = select_bins_global(
+            all_keys, include_meas_set_for_sel, meas_db, q2bins, veto_windows)
+        print_selection_report(selection_report)
+
     results = []
     for (q2lo, q2hi) in q2bins:
-        keys_bin = filter_to_contained_bin(all_keys, (q2lo, q2hi), veto_windows=veto_windows)
+        if use_global_selection:
+            # Phase 2: assign globally-selected keys to this scan bin
+            keys_bin = assign_keys_to_scan_bin(selected_keys, (q2lo, q2hi), veto_windows)
+        else:
+            keys_bin, _ = filter_to_contained_bin(all_keys, (q2lo, q2hi), veto_windows=veto_windows)
+
         if not keys_bin:
-            print(f"\nBin {q2lo}-{q2hi}: no exact-edge constrained observables found, skipping.", flush=True)
+            print(f"\nBin {q2lo}-{q2hi}: no constrained observables found, skipping.", flush=True)
             continue
 
         print(f"\nBin {q2lo}-{q2hi}: nobs={len(keys_bin)}", flush=True)
@@ -772,7 +1058,11 @@ def main():
 
     print("\nNotes:")
     print("- This is an effective Delta C9 per bin (absorbs nonlocal charm).")
-    print("- It uses all observables whose q2 bin is contained within the requested bin.")
+    if use_global_selection:
+        print("- Two-phase global bin selection: non-overlapping bins chosen per (paper, obs),")
+        print("  then assigned to scan bins by >=50% width overlap.")
+    else:
+        print("- Using all observables whose q2 bin is contained within the requested bin.")
     print("- Veto removes any bin overlapping the specified windows.")
     print("- For speed while iterating: try --fast-N 50 --fast-Nexp 1000 and fewer --npts.")
 

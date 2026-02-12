@@ -61,11 +61,22 @@ def make_figure(datasets, key, title_suffix=""):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--input", nargs="+", required=True)
+    ap.add_argument("--labels", nargs="+", default=None,
+                    help="Legend labels, one per input file. "
+                         "Falls back to metadata mode+obs_kind or filename stem.")
     ap.add_argument("--output", default=None, help="Output file prefix")
     ap.add_argument("--title", default=None)
     args = ap.parse_args()
 
-    all_data = [(load(p), series_label(load(p), p)) for p in args.input]
+    if args.labels and len(args.labels) != len(args.input):
+        ap.error(f"--labels count ({len(args.labels)}) must match "
+                 f"--input count ({len(args.input)})")
+
+    all_data = []
+    for i, p in enumerate(args.input):
+        d = load(p)
+        lbl = args.labels[i] if args.labels else series_label(d, p)
+        all_data.append((d, lbl))
 
     # Nominal figure
     fig_nom = make_figure(all_data, "results")

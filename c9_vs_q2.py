@@ -13,6 +13,15 @@ from pathlib import Path
 from scipy.stats import chi2 as scipy_chi2
 
 
+def _json_safe(val):
+    """Convert None / nan / inf to JSON-safe values."""
+    if val is None:
+        return None
+    if isinstance(val, float) and (math.isnan(val) or math.isinf(val)):
+        return None
+    return val
+
+
 CHANNEL_PATTERNS = {
     "Kstar": [r"\bB0->K\*0?mumu\b", r"\bBd->K\*0?mumu\b"],
     "K":     [r"\bB\+->K\+?mumu\b"],
@@ -233,7 +242,7 @@ def print_bin_publications(q2lo, q2hi, keys_bin, db, curated_pubs=None, include_
 
     overlap_warnings = check_overlap_warnings(keys_bin, db, include_meas=include_meas)
     if overlap_warnings:
-        print(f"  *** OVERLAP WARNINGS ***")
+        print(f"  *** POSSIBLE OVERLAP WARNINGS ***")
         for exp, p1, p2, obs_names in overlap_warnings:
             print(f"    {exp}: {p1} & {p2} both measure {_compact_obs_names(obs_names)}")
 
@@ -728,13 +737,14 @@ def fmt(x):
 
 
 def chi2_from_pulls(pull_list):
-    """Compute chi2/ndf and p-value from a list of (label, pull) tuples.
+    """Compute chi2/ndf and p-value from a list of pull tuples.
 
+    Accepts (label, pull) or (key, label, pull) tuples.
     chi2 = sum(pull_i^2).  This ignores off-diagonal correlations between
     observables but is always non-negative and easy to interpret.
     ndf = n_pulls - 1  (one fitted parameter: C9).
     """
-    valid = [p for _, p in pull_list if not math.isnan(p)]
+    valid = [t[-1] for t in pull_list if not math.isnan(t[-1])]
     if not valid:
         return float("nan"), 0, float("nan")
     chi2_val = sum(p * p for p in valid)
@@ -816,7 +826,7 @@ def consistency_by_publication(keys_bin, include_meas, c9_grid_coarse, meas_db, 
 def consistency_pulls(fl, c9_best, keys_bin):
     """Compute pull = (measured - predicted) / sigma for each observable at best-fit C9.
 
-    Returns list of (obs_label, pull) sorted by |pull| descending.
+    Returns list of (key, obs_label, pull) sorted by |pull| descending.
     """
     wc = make_wc_delta_c9(c9_best)
     par = fl.parameters_central
@@ -857,10 +867,56 @@ def consistency_pulls(fl, c9_best, keys_bin):
         else:
             label = obs_name
 
-        pulls.append((label, pull))
+        pulls.append((key, label, pull))
 
-    pulls.sort(key=lambda x: abs(x[1]) if not math.isnan(x[1]) else 0, reverse=True)
+    pulls.sort(key=lambda x: abs(x[2]) if not math.isnan(x[2]) else 0, reverse=True)
     return pulls
+
+
+def sigma_clip_observables(keys_bin, include_meas, c9_grid, args, clip_sigma=3.0):
+    """Iteratively remove observables with |pull| > clip_sigma, refitting each round.
+
+    Returns (clipped_keys, removed_list, c9_best, sigma, left, right, fl)
+    where removed_list is [(label, pull, iteration), ...].
+    """
+    current_keys = list(keys_bin)
+    removed = []
+    iteration = 0
+    fl = None
+    c9_best = sigma = left = right = float("nan")
+
+    for iteration in range(1, 11):  # max 10 iterations
+        sub_meas = _filter_measurements_for_obs(current_keys, include_meas) if include_meas else None
+        fl = build_fastlikelihood(
+            name=f"clip_iter{iteration}",
+            observables=current_keys,
+            include_measurements=sub_meas,
+            threads=args.threads,
+            fast_N=args.fast_N,
+            fast_Nexp=args.fast_Nexp,
+        )
+        ll = scan_c9_fast(fl, c9_grid, label=f"  clip iter {iteration}",
+                          report_every=0, threads=args.threads)
+        c9_best, sigma, left, right, _, _ = estimate_best_and_sigma(c9_grid, ll)
+
+        pull_list = consistency_pulls(fl, c9_best, current_keys)
+        outliers = [(key, label, pull) for key, label, pull in pull_list
+                    if not math.isnan(pull) and abs(pull) > clip_sigma]
+
+        if not outliers:
+            break
+
+        outlier_keys = set()
+        for key, label, pull in outliers:
+            removed.append((label, pull, iteration))
+            outlier_keys.add(key)
+
+        current_keys = [k for k in current_keys if k not in outlier_keys]
+        if not current_keys:
+            print(f"    [warn] sigma clipping removed all observables!", flush=True)
+            break
+
+    return current_keys, removed, c9_best, sigma, left, right, fl
 
 
 def _fmt_c9_sig(c9, sig, at_boundary, grid_lo, grid_hi):
@@ -879,8 +935,12 @@ def _fmt_c9_sig(c9, sig, at_boundary, grid_lo, grid_hi):
 
 
 def print_consistency_report(fl, c9_best, sigma, keys_bin, include_meas,
-                             c9_grid_coarse, meas_db, curated_pubs, args):
-    """Print a full consistency report for the current bin."""
+                             c9_grid, c9_grid_coarse, meas_db, curated_pubs, args):
+    """Print a full consistency report for the current bin.
+
+    Returns (clipped_keys, cl_c9, cl_sig, cl_left, cl_right) when sigma-clipping
+    removed outliers, or None if nothing was clipped.
+    """
     grid_lo, grid_hi = c9_grid_coarse[0], c9_grid_coarse[-1]
     print(f"\n  Consistency report:", flush=True)
 
@@ -908,11 +968,35 @@ def print_consistency_report(fl, c9_best, sigma, keys_bin, include_meas,
 
     # 5. Pull table
     print(f"\n    Pulls at C9 = {c9_best:.2f}:", flush=True)
-    for label, pull in pull_list:
+    for _, label, pull in pull_list:
         sign = "+" if pull >= 0 else ""
         print(f"      {label:<45s} {sign}{pull:.1f}\u03c3", flush=True)
 
+    # 6. Sigma-clipping
+    clip_sigma = args.clip_sigma
+    print(f"\n    Sigma-clipped (|pull| > {clip_sigma:.1f}\u03c3):", flush=True)
+    clipped_keys, removed, cl_c9, cl_sig, cl_left, cl_right, cl_fl = \
+        sigma_clip_observables(keys_bin, include_meas, c9_grid, args, clip_sigma=clip_sigma)
+
+    if removed:
+        for label, pull, iteration in removed:
+            sign = "+" if pull >= 0 else ""
+            print(f"      iter {iteration}: removed {label} (pull = {sign}{pull:.1f}\u03c3)", flush=True)
+        cl_pulls = consistency_pulls(cl_fl, cl_c9, clipped_keys)
+        cl_chi2, cl_ndf, cl_pval = chi2_from_pulls(cl_pulls)
+        n_total = len(keys_bin)
+        n_removed = len(removed)
+        print(f"      After clipping: C9 = {cl_c9:.2f} \u00b1 {cl_sig:.2f}, "
+              f"chi2/ndf = {cl_chi2:.1f}/{cl_ndf}, p = {cl_pval:.2f} "
+              f"(removed {n_removed} of {n_total} obs)", flush=True)
+    else:
+        print(f"      no outliers above {clip_sigma:.1f}\u03c3", flush=True)
+
     print(flush=True)
+
+    if removed:
+        return clipped_keys, cl_c9, cl_sig, cl_left, cl_right, cl_chi2, cl_ndf, cl_pval
+    return None
 
 
 def main():
@@ -930,7 +1014,7 @@ def main():
     ap.add_argument("--obs-kind", choices=["angular", "rate", "both"], default="both",
                     help="Use angular observables, rate observables, or both.")
 
-    ap.add_argument("--bins", default="0.1-0.98,1.1-2.5,2.5-4,4-6,15-17,17-19",
+    ap.add_argument("--bins", default="0.1-0.98,1.1-2.5,2.5-4,4-6,15-17,17-19,19-22",
                     help="Comma-separated q2 bins, each as lo-hi in GeV^2.")
     ap.add_argument("--veto", default="8.68-14.18",
                     help="Comma-separated veto windows lo-hi. Use empty string to disable.")
@@ -939,6 +1023,10 @@ def main():
     ap.add_argument("--quiet-warnings", action="store_true")
     ap.add_argument("--consistency", action="store_true",
                     help="Print consistency report (chi2, sub-fits by channel/pub, pulls).")
+    ap.add_argument("--clip-sigma", type=float, default=3.0,
+                    help="Sigma threshold for iterative outlier clipping in consistency report.")
+    ap.add_argument("--output-json", type=str, default=None,
+                    help="Save results to a JSON file.")
     args = ap.parse_args()
 
     if args.quiet_warnings:
@@ -1013,6 +1101,8 @@ def main():
         print_selection_report(selection_report)
 
     results = []
+    clipped_results = []
+    any_clipped = False
     for (q2lo, q2hi) in q2bins:
         if use_global_selection:
             # Phase 2: assign globally-selected keys to this scan bin
@@ -1041,22 +1131,49 @@ def main():
         ll = scan_c9_fast(fl, c9_grid, label=f"{q2lo}-{q2hi}", report_every=args.report_every, threads=args.threads)
         c9_best, sig, left, right, _, _ = estimate_best_and_sigma(c9_grid, ll)
 
-        results.append((q2lo, q2hi, len(keys_bin), c9_best, sig, left, right))
+        pull_list = consistency_pulls(fl, c9_best, keys_bin)
+        chi2_val, ndf, p_value = chi2_from_pulls(pull_list)
+
+        results.append((q2lo, q2hi, len(keys_bin), c9_best, sig, left, right, chi2_val, ndf, p_value))
 
         if args.consistency:
-            print_consistency_report(
+            clip_result = print_consistency_report(
                 fl, c9_best, sig, keys_bin, include_meas,
-                c9_grid_coarse, meas_db, curated_pubs, args,
+                c9_grid, c9_grid_coarse, meas_db, curated_pubs, args,
             )
+            if clip_result is not None:
+                cl_keys, cl_c9, cl_sig, cl_left, cl_right, cl_chi2, cl_ndf, cl_pval = clip_result
+                clipped_results.append((q2lo, q2hi, len(cl_keys), cl_c9, cl_sig, cl_left, cl_right, cl_chi2, cl_ndf, cl_pval))
+                any_clipped = True
+            else:
+                # No outliers — carry nominal result into clipped table
+                clipped_results.append((q2lo, q2hi, len(keys_bin), c9_best, sig, left, right, chi2_val, ndf, p_value))
 
-    print("\n" + "=" * 92)
+    hdr = "{:>10} {:>10} {:>6} {:>12} {:>10} {:>12} {:>12} {:>10} {:>6}".format(
+        "q2min", "q2max", "Nobs", "C9_best", "sigma", "68%_lo", "68%_hi", "chi2/ndf", "p")
+
+    def _fmt_row(q2lo, q2hi, nobs, c9_best, sig, left, right, chi2_val, ndf, p_value):
+        left_s = f"{left:>12.2f}" if left is not None else f"{'n/a':>12}"
+        right_s = f"{right:>12.2f}" if right is not None else f"{'n/a':>12}"
+        chi2_s = f"{chi2_val:.1f}/{ndf}" if not math.isnan(chi2_val) else "n/a"
+        p_s = f"{p_value:.2f}" if not math.isnan(p_value) else "n/a"
+        return (f"{q2lo:>10.2f} {q2hi:>10.2f} {nobs:>6d} {c9_best:>12.2f} {sig:>10.2f}"
+                f" {left_s} {right_s} {chi2_s:>10} {p_s:>6}")
+
+    print("\n" + "=" * 110)
     print("Delta C9_bsmumu per q2 bin (piecewise effective fit)")
-    print("=" * 92)
-    print("{:>10} {:>10} {:>6} {:>12} {:>10} {:>12} {:>12}".format("q2min", "q2max", "Nobs", "C9_best", "sigma", "68%_lo", "68%_hi"))
-    for (q2lo, q2hi, nobs, c9_best, sig, left, right) in results:
-        print("{:>10.2f} {:>10.2f} {:>6d} {:>12.2f} {:>10.2f} {:>12.2f} {:>12.2f}".format(
-            q2lo, q2hi, nobs, c9_best, sig, left, right
-        ))
+    print("=" * 110)
+    print(hdr)
+    for row in results:
+        print(_fmt_row(*row))
+
+    if any_clipped:
+        print("\n" + "=" * 110)
+        print(f"Delta C9_bsmumu per q2 bin — after sigma-clipping (|pull| > {args.clip_sigma:.1f}sigma)")
+        print("=" * 110)
+        print(hdr)
+        for row in clipped_results:
+            print(_fmt_row(*row))
 
     print("\nNotes:")
     print("- This is an effective Delta C9 per bin (absorbs nonlocal charm).")
@@ -1067,6 +1184,33 @@ def main():
         print("- Using all observables whose q2 bin is contained within the requested bin.")
     print("- Veto removes any bin overlapping the specified windows.")
     print("- For speed while iterating: try --fast-N 50 --fast-Nexp 1000 and fewer --npts.")
+
+    if args.output_json:
+        import json
+
+        def _row_dict(row):
+            q2lo, q2hi, nobs, c9, sig, left, right, chi2v, ndf, pval = row
+            return {
+                "q2min": q2lo, "q2max": q2hi, "nobs": nobs,
+                "c9_best": _json_safe(c9), "sigma": _json_safe(sig),
+                "cl_lo": _json_safe(left), "cl_hi": _json_safe(right),
+                "chi2": _json_safe(chi2v), "ndf": ndf, "p_value": _json_safe(pval),
+            }
+
+        payload = {
+            "metadata": {
+                "mode": args.mode,
+                "obs_kind": args.obs_kind,
+                "c9min": args.c9min, "c9max": args.c9max, "npts": args.npts,
+                "fast_N": args.fast_N, "fast_Nexp": args.fast_Nexp,
+                "clip_sigma": args.clip_sigma if args.consistency else None,
+            },
+            "results": [_row_dict(r) for r in results],
+            "clipped_results": [_row_dict(r) for r in clipped_results] if any_clipped else None,
+        }
+        with open(args.output_json, "w") as f:
+            json.dump(payload, f, indent=2)
+        print(f"\nResults saved to {args.output_json}")
 
 
 if __name__ == "__main__":
